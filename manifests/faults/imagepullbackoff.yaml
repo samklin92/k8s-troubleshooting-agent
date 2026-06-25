@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: broken-image-pod
+  namespace: default
+  labels:
+    fault-type: image-pull-backoff
+spec:
+  containers:
+    - name: app
+      image: nginx:this-tag-does-not-exist-12345

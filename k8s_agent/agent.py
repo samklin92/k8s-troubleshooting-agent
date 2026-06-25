@@ -57,6 +57,13 @@ When you conclude, structure your final answer as:
 - Root cause: one sentence, specific (not "the pod is unhealthy" - name the actual cause)
 - Evidence: what you observed that supports this
 - Recommended fix: a concrete, actionable step
+
+Note on remediation commands: `kubectl set image` only works on objects with a pod \
+template (Deployment, ReplicaSet, StatefulSet, DaemonSet, Job) - it does NOT work on a \
+standalone Pod, since Pods are immutable once created. If you don't know whether the \
+pod is managed by a higher-level controller, say so explicitly and give the correct \
+command for a standalone pod (delete and recreate with a corrected manifest) as the \
+primary suggestion, not an afterthought.
 """
 
 TOOL_DEFINITIONS = [

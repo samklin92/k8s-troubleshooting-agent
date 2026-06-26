@@ -356,7 +356,7 @@ kubectl delete -f manifests/faults/crashloopbackoff.yaml
 Install dependencies:
 
 ```bash
-pip install kubernetes anthropic python-dotenv
+pip install kubernetes anthropic python-dotenv fastapi uvicorn prometheus-client
 ```
 
 Create a local cluster using `kind`:
@@ -378,6 +378,38 @@ ANTHROPIC_API_KEY=your-api-key
 ```bash
 python k8s_agent/agent.py "There's a pod that seems unhealthy" default
 ```
+
+## Running as a service
+
+The agent can also run as an HTTP service rather than a one-shot CLI script, with Prometheus metrics exposed for scraping:
+
+```bash
+cd k8s_agent
+uvicorn main:app --port 8000
+```
+
+Endpoints:
+
+- `POST /investigate` - run a real investigation. Body: `{"symptom": "...", "namespace": "default"}`
+- `GET /metrics` - Prometheus scrape endpoint
+- `GET /healthz` - liveness check, does not touch the cluster or Claude
+
+```bash
+curl -X POST http://localhost:8000/investigate \
+  -H "Content-Type: application/json" \
+  -d '{"symptom": "A pod looks broken", "namespace": "default"}'
+```
+
+### What the metrics actually show
+
+Verified against two different live fault types, the metrics confirm the agent varies its tool usage based on what it finds - not just calling every available tool every time:
+
+| Fault type | Tool calls made | Iterations | Why |
+|---|---|---|---|
+| `crash_loop` | `list_pods`, `get_pod_logs` | 3 | Root cause only visible in container logs |
+| `image_pull_failure` | `list_pods` only | 2 | `list_pods`'s message field was already sufficient |
+
+Metrics exposed: investigation outcome (diagnosed/inconclusive), tool calls by name, investigation duration, iteration count, and fault families observed - see `k8s_agent/metrics.py` for full definitions and rationale.
 
 ---
 

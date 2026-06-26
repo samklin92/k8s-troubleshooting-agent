@@ -1,5 +1,6 @@
 # Kubernetes Troubleshooting Agent
-<img width="1536" height="1024" alt="Kubernetes troubleshooting agent" src="https://github.com/user-attachments/assets/58f324e2-d58c-431b-9dcd-c603b3c82197" />
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/96da98c1-72ff-4a9b-85e4-ad0c83dff1da" />
+
 
 An agentic Kubernetes diagnostic tool that investigates unhealthy pods by gathering evidence from a live cluster, reasoning through the failure state, and producing a specific root cause with actionable remediation guidance.
 

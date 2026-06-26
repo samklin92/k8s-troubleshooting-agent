@@ -252,6 +252,39 @@ The corrected remediation behavior generalized successfully across unrelated fau
 
 ---
 
+## 5. Containerd log-retention timing during automated testing
+
+Even when the Kubernetes API call for `--previous` container logs succeeded without error, the actual content returned was sometimes a containerd-level runtime message (`unable to retrieve container logs for containerd://...`) rather than real log content - if the previous container's logs had already been garbage collected.
+
+This was caught specifically by writing an automated pytest suite and running it in CI, under different timing than manual verification. Manual testing happened to run within the log-retention window every time; an automated run did not.
+
+### Fix
+
+`get_pod_logs.py` now detects this specific runtime message and reports it as `previous_available=False`, since "logs unavailable" is not usable diagnostic content even though the API call itself didn't raise an error. A regression test locks in the correct behavior going forward.
+
+---
+
+# Testing & CI
+
+Manual verification against a live cluster found the first four bugs above. The fifth was found only after that verification process was converted into an automated pytest suite - proof that codifying manual checks catches real issues manual testing alone can miss.
+
+## Test suite
+
+Integration tests run against a real `kind` cluster with the same fault-injection manifests used during development - not mocks. Each test applies a real fault, asserts on the tool's actual output, then tears the fault down.
+
+```bash
+pytest tests/ -v
+```
+
+## Continuous integration
+
+Two GitHub Actions jobs, intentionally separated by cost and reliability profile:
+
+- **`test-tools`** - runs on every push and pull request. Spins up a fresh `kind` cluster in the runner, runs the full pytest suite against `list_pods.py` and `get_pod_logs.py`. Free, deterministic, fast. This is the job that gates merges.
+- **`test-agent-smoke`** - runs only on direct pushes to `main`, after `test-tools` passes. Injects a real fault, runs the full Claude agentic loop against it, and verifies the diagnosis actually names the root cause. Costs real Anthropic API tokens and depends on an external service, so it's an integration smoke test, not a merge gate.
+
+---
+
 # Why use an agent instead of static monitoring?
 
 Traditional monitoring systems detect symptoms.

@@ -11,9 +11,7 @@ verified against live fault injections (ImagePullBackOff/ErrImagePull
 cycling, CrashLoopBackOff, and scheduling failures) before being exposed
 to the agent. get_events and describe_resource are deliberately not
 included yet; testing showed list_pods + get_pod_logs already provide a
-full root cause for all three fault families built so far. They can be
-added if a real fault type is found that needs them, rather than added
-speculatively.
+full root cause for all three fault families built so far.
 
 Safety: MAX_ITERATIONS bounds the tool-calling loop. Without this, a
 malformed prompt or an unexpected tool-call pattern could loop indefinitely
@@ -21,16 +19,28 @@ against a live cluster, burning API calls and Anthropic tokens with no
 upper bound. This is a hard cap, not a soft suggestion - the loop stops
 and reports inconclusive after MAX_ITERATIONS regardless of whether Claude
 asks for more.
+
+Observability: every investigation is instrumented with Prometheus metrics
+(outcome, duration, iteration count, tool calls made, fault families seen).
+See metrics.py for the metric definitions and the rationale behind each one.
 """
 
 import json
 import os
+import time
 
 import anthropic
 from dotenv import load_dotenv
 
 from get_pod_logs import get_pod_logs
 from list_pods import list_pods
+from metrics import (
+    fault_family_total,
+    investigation_duration_seconds,
+    investigation_iterations,
+    investigations_total,
+    tool_calls_total,
+)
 
 load_dotenv()
 
@@ -106,6 +116,25 @@ TOOL_DEFINITIONS = [
 
 
 def run_investigation(symptom: str, namespace: str = "default") -> str:
+    """
+    Runs a full investigation and records duration as a metric. Outcome,
+    iteration count, and fault-family metrics are recorded inside _run_loop
+    itself, at the point each is actually known (the diagnosed-return or
+    inconclusive-return paths) - not here, so a failure partway through a
+    multi-metric update can't leave metrics in a half-recorded state.
+    """
+    start_time = time.monotonic()
+    seen_fault_families = set()
+
+    try:
+        result, _ = _run_loop(symptom, namespace, seen_fault_families)
+        return result
+    finally:
+        duration = time.monotonic() - start_time
+        investigation_duration_seconds.observe(duration)
+
+
+def _run_loop(symptom: str, namespace: str, seen_fault_families: set) -> tuple[str, int]:
     client_ = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
     messages = [{"role": "user", "content": f"{symptom} (namespace: {namespace})"}]
@@ -120,18 +149,29 @@ def run_investigation(symptom: str, namespace: str = "default") -> str:
         )
 
         if response.stop_reason != "tool_use":
-            # Claude has concluded - extract and return the final text answer.
-            return _extract_text(response)
+            result_text = _extract_text(response)
+            investigations_total.labels(outcome="diagnosed").inc()
+            investigation_iterations.observe(iteration + 1)
+            for family in seen_fault_families:
+                fault_family_total.labels(fault_family=family).inc()
+            return result_text, iteration + 1
 
-        # Claude wants to call one or more tools. Execute each, append results,
-        # and loop back for Claude's next decision.
         messages.append({"role": "assistant", "content": response.content})
 
         tool_results = []
         for block in response.content:
             if block.type != "tool_use":
                 continue
+
+            tool_calls_total.labels(tool_name=block.name).inc()
             result = _execute_tool(block.name, block.input)
+
+            if block.name == "list_pods":
+                for pod in result:
+                    for c in pod.get("containers", []):
+                        if c.get("fault_family"):
+                            seen_fault_families.add(c["fault_family"])
+
             tool_results.append(
                 {
                     "type": "tool_result",
@@ -142,12 +182,18 @@ def run_investigation(symptom: str, namespace: str = "default") -> str:
 
         messages.append({"role": "user", "content": tool_results})
 
-    return (
+    investigations_total.labels(outcome="inconclusive").inc()
+    investigation_iterations.observe(MAX_ITERATIONS)
+    for family in seen_fault_families:
+        fault_family_total.labels(fault_family=family).inc()
+
+    inconclusive_message = (
         f"INCONCLUSIVE: investigation did not reach a diagnosis within {MAX_ITERATIONS} "
         f"tool-call iterations. This is a safety cap, not a sign the issue is unsolvable - "
         f"it likely means the agent needs an additional tool (e.g. get_events) for this "
         f"fault type, or got stuck re-requesting the same information."
     )
+    return inconclusive_message, MAX_ITERATIONS
 
 
 def _execute_tool(name: str, input_data: dict):

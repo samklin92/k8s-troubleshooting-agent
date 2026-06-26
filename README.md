@@ -1,159 +1,457 @@
 # Kubernetes Troubleshooting Agent
 
-An agentic Kubernetes diagnostic tool. Claude investigates pod failures by
-calling tools to gather evidence (pod status, container logs), reasons about
-what it's found, and produces a specific root cause and an actionable fix -
-rather than a generic "the pod is unhealthy" response.
+An agentic Kubernetes diagnostic tool that investigates unhealthy pods by gathering evidence from a live cluster, reasoning through the failure state, and producing a specific root cause with actionable remediation guidance.
 
-Built and tested against a local `kind` cluster with deliberately injected
-faults, verifying each tool independently against real cluster behavior
-before wiring anything into the agent loop.
+Instead of returning a generic status like:
 
-## Why this exists
+> "Pod is unhealthy"
 
-`kubectl get pods` tells you a pod is in `CrashLoopBackOff`. It doesn't tell
-you *why* - that requires correlating container state, restart history, and
-log output, which is exactly the kind of multi-step investigation an
-engineer does manually during an incident. This tool automates that
-investigation: it decides which signals to check based on what it's already
-found, the same way a human would.
+the agent performs the same multi-step investigation an engineer would during a real incident:
 
-## Architecture
-Symptom (free text)
+* Inspect pod state
+* Correlate restart behavior
+* Analyze container logs
+* Classify the fault family
+* Identify the underlying cause
+* Recommend a concrete fix
 
-|
+Built and tested against a real local `kind` cluster with intentionally injected Kubernetes failures.
 
-v
+---
 
-agent.py (Claude agentic loop, MAX_ITERATIONS=6 safety cap)
+# Why this exists
 
-|
+Kubernetes exposes symptoms very well.
 
-+--> list_pods    (pod phase, scheduling status, container state,
+It does **not** always explain causes.
 
-|                  fault-family classification)
+For example:
 
-|
+```bash
+kubectl get pods
+```
 
-+--> get_pod_logs (current + previous container logs, called only
+may show:
 
-when list_pods alone doesn't explain the cause)
+```text
+CrashLoopBackOff
+```
 
-|
+But that alone does not explain:
 
-v
+* why the container crashed,
+* what triggered the restart loop,
+* or how to fix it.
 
-Root cause + evidence + recommended fix
-### Design principle: tools verified independently before being given to the agent
+Finding the actual cause typically requires manually correlating:
 
-Each tool was built and tested against a real fault on a real cluster
-*before* being exposed to Claude as a callable tool. This caught several
-real bugs that would otherwise have surfaced as confusing agent behavior
-with no clear cause - see below.
+* container state,
+* restart history,
+* scheduling conditions,
+* and application logs.
 
-## Fault families covered
+This project automates that investigative workflow using an LLM-driven agentic loop.
 
-| Fault family | Detected by | Root cause source |
-|---|---|---|
-| `image_pull_failure` (`ImagePullBackOff` / `ErrImagePull`) | `list_pods` | `list_pods` message field is usually sufficient |
-| `crash_loop` (`CrashLoopBackOff`) | `list_pods` (restart count + state reason) | `get_pod_logs` - required, root cause only in container output |
-| `scheduling_failure` (unschedulable / `Pending`) | `list_pods` (`PodScheduled` condition) | `list_pods` - the condition's own `message` field already has full detail |
+---
 
-`get_events` and `describe_resource` were deliberately not built - testing
-showed `list_pods` + `get_pod_logs` already provide a complete root cause
-for all three fault families above. They would be the natural next addition
-if a fault type requiring them is identified (e.g. networking/Service
-misconfiguration, where the relevant signal lives in Events history rather
-than current pod state).
+# Technical highlights
 
-## Real bugs found during verification
+* Agentic troubleshooting workflow using Claude tool-calling
+* Real Kubernetes fault injection with reproducible manifests
+* Structured fault-family normalization for unstable Kubernetes states
+* Tool-first verification before agent integration
+* Root-cause analysis driven by evidence correlation
+* Explicit iteration and API safety limits
+* Tested against real cluster behavior rather than mocked responses
 
-1. **Fault-state cycling** - a failing image pull alternates between
-   `ImagePullBackOff` and `ErrImagePull` depending on the exact instant you
-   poll. Classifying on the raw reason string alone would make detection
-   non-deterministic. Fixed with a `FAULT_FAMILIES` normalization map that
-   treats both as the same underlying fault.
-2. **`phase=Running` during CrashLoopBackOff** - Kubernetes reports a
-   crashing pod's phase as `Running`, not `Pending` or `Failed`, because
-   there are brief windows between crashes where the container genuinely is
-   running. Health checks based on `phase` alone would miss this fault
-   entirely; `is_healthy` checks container state reasons instead.
-3. **Kubernetes Python client log deserialization bug** - calling
-   `read_namespaced_pod_log()` with default auto-deserialization returned a
-   `str` containing the literal characters `b'...'` and a literal
-   backslash-n, rather than decoded text with a real newline. Confirmed by
-   comparing against `_preload_content=False`, which returns clean raw
-   bytes. Worked around by always requesting raw bytes and decoding
-   manually rather than relying on the client's built-in deserialization.
-4. **Incorrect remediation guidance** - the agent's first version
-   recommended `kubectl set image` for a standalone Pod, which doesn't work
-   (that command only applies to Deployments/ReplicaSets/etc - Pods are
-   immutable once created). Fixed via an explicit system prompt instruction;
-   verified the corrected guidance generalized correctly to a second,
-   unrelated fault type without being re-prompted.
+---
 
-All four were caught by testing against a real local cluster with real
-injected faults, not by reasoning about the code in the abstract.
+# Architecture
 
-## Setup
+```text
+User symptom
+(e.g. "A pod seems unhealthy")
+            |
+            v
++----------------------------------+
+| Claude Agentic Reasoning Loop    |
+|  - Observe                       |
+|  - Reason                        |
+|  - Decide next action            |
++----------------------------------+
+            |
+            +----------------------+
+            |                      |
+            v                      v
+
++-------------------+    +-------------------+
+| list_pods         |    | get_pod_logs      |
+|                   |    |                   |
+| - pod phase       |    | - current logs    |
+| - scheduling      |    | - previous logs   |
+| - restart counts  |    | - crash evidence  |
+| - container state |    |                   |
++-------------------+    +-------------------+
+            |
+            v
+Root cause + evidence + remediation
+```
+
+---
+
+# How the agent reasons
+
+The system follows an iterative observe → reason → act workflow.
+
+1. Gather initial cluster evidence using `list_pods`
+2. Classify the likely fault family
+3. Decide whether additional evidence is required
+4. Call targeted tools only when necessary
+5. Produce a root-cause diagnosis and remediation plan
+
+The agent does not blindly call every tool.
+
+It selectively gathers additional evidence based on what it already knows, similar to how a human engineer investigates incidents.
+
+---
+
+# Design principle
+
+## Tools were verified independently before agent integration
+
+Each tool was built and tested directly against a real Kubernetes fault before being exposed to the agent.
+
+This prevented ambiguous failures where it becomes unclear whether:
+
+* the tool is wrong,
+* the cluster state is misleading,
+* or the LLM reasoning failed.
+
+Verifying tools independently uncovered several real Kubernetes and client edge cases before they became agent failures.
+
+---
+
+# Fault families currently supported
+
+| Fault family                                              | Detection source | Root cause source        |
+| --------------------------------------------------------- | ---------------- | ------------------------ |
+| `image_pull_failure` (`ImagePullBackOff`, `ErrImagePull`) | `list_pods`      | Pod/container status     |
+| `crash_loop` (`CrashLoopBackOff`)                         | `list_pods`      | `get_pod_logs`           |
+| `scheduling_failure` (`Pending`, unschedulable)           | `list_pods`      | Pod scheduling condition |
+
+The current toolset intentionally excludes:
+
+* `kubectl describe`-style resource inspection
+* Kubernetes Events analysis
+
+Testing showed the existing tools already provide complete root-cause coverage for the supported fault families.
+
+Those capabilities would become useful for future fault categories such as:
+
+* Service/networking failures
+* PersistentVolume issues
+* ResourceQuota enforcement
+* Ingress misconfiguration
+
+---
+
+# Real bugs discovered during verification
+
+## 1. Fault-state cycling during image pull failures
+
+A broken image pull alternates between:
+
+* `ErrImagePull`
+* `ImagePullBackOff`
+
+depending on the exact polling moment.
+
+Classification based purely on raw reason strings produced non-deterministic detection.
+
+### Fix
+
+Implemented a `FAULT_FAMILIES` normalization layer mapping both states to a single fault category.
+
+---
+
+## 2. `phase=Running` during `CrashLoopBackOff`
+
+Kubernetes may report a crashing pod as:
+
+```text
+phase = Running
+```
+
+because the container briefly enters a running state between crashes.
+
+A health check based only on pod phase would incorrectly classify the pod as healthy.
+
+### Fix
+
+Health evaluation was updated to inspect container state reasons and restart behavior rather than relying on pod phase alone.
+
+---
+
+## 3. Kubernetes Python client log deserialization issue
+
+The Kubernetes Python client returned malformed log output when using default auto-deserialization.
+
+Instead of properly decoded text:
+
+```text
+line1
+line2
+```
+
+the client returned:
+
+```text
+b'line1\nline2'
+```
+
+with literal byte-string formatting and escaped newlines.
+
+### Fix
+
+Switched to:
+
+```python
+_preload_content=False
+```
+
+and manually decoded raw bytes.
+
+This produced clean, reliable log output for agent analysis.
+
+---
+
+## 4. Incorrect remediation guidance
+
+An early version of the agent recommended:
+
+```bash
+kubectl set image
+```
+
+against a standalone Pod.
+
+That command only works for mutable controllers such as:
+
+* Deployments
+* ReplicaSets
+* StatefulSets
+
+Standalone Pods are immutable after creation.
+
+### Fix
+
+The system prompt was updated with explicit Kubernetes immutability constraints.
+
+The corrected remediation behavior generalized successfully across unrelated fault types.
+
+---
+
+# Why use an agent instead of static monitoring?
+
+Traditional monitoring systems detect symptoms.
+
+This project investigates causes.
+
+Example:
+
+| Traditional monitoring     | This agent                          |
+| -------------------------- | ----------------------------------- |
+| Detects `CrashLoopBackOff` | Explains why the container crashed  |
+| Raises an alert            | Correlates restart history and logs |
+| Shows unhealthy state      | Produces remediation guidance       |
+
+The goal is not replacing monitoring.
+
+The goal is reducing time-to-root-cause during incidents.
+
+---
+
+# Example investigation
+
+## Inject a fault
+
+```bash
+kubectl apply -f manifests/faults/crashloopbackoff.yaml
+```
+
+Wait for the container to fail:
+
+```bash
+sleep 15
+```
+
+Run the agent:
+
+```bash
+python k8s_agent/agent.py "A pod is failing" default
+```
+
+## Example output
+
+```text
+Detected fault family: crash_loop
+
+Evidence:
+- Restart count: 6
+- Container state: CrashLoopBackOff
+- Previous container logs:
+  Error: DATABASE_URL environment variable missing
+
+Root cause:
+The application exits immediately because DATABASE_URL is not configured.
+
+Recommended fix:
+Add DATABASE_URL to the Deployment environment variables or Kubernetes Secret.
+```
+
+Clean up:
+
+```bash
+kubectl delete -f manifests/faults/crashloopbackoff.yaml
+```
+
+---
+
+# Setup
+
+Install dependencies:
 
 ```bash
 pip install kubernetes anthropic python-dotenv
 ```
 
-Create a local `kind` cluster (requires Docker):
+Create a local cluster using `kind`:
 
 ```bash
 kind create cluster --name devops-agent-cluster
 ```
 
-Create a `.env` file in the project root (never commit this - it's already
-in `.gitignore`):
-ANTHROPIC_API_KEY=your-key-here
-## Usage
+Create a `.env` file in the project root:
+
+```env
+ANTHROPIC_API_KEY=your-api-key
+```
+
+---
+
+# Usage
 
 ```bash
 python k8s_agent/agent.py "There's a pod that seems unhealthy" default
 ```
 
-Inject a test fault first to see it in action:
+---
 
-```bash
-kubectl apply -f manifests/faults/crashloopbackoff.yaml
-sleep 15  # let it actually crash at least once
-python k8s_agent/agent.py "A pod is failing" default
-kubectl delete -f manifests/faults/crashloopbackoff.yaml  # clean up
+# Project structure
+
+```text
+k8s_agent/
+├── list_pods.py
+├── get_pod_logs.py
+└── agent.py
+
+manifests/faults/
+├── imagepullbackoff.yaml
+├── crashloopbackoff.yaml
+└── pending-unschedulable.yaml
 ```
 
-## Project structure
-k8s_agent/
+## Components
 
-|-- list_pods.py       # Structured pod status: phase, scheduling, container state, fault family
+### `list_pods.py`
 
-|-- get_pod_logs.py     # Current + previous container logs
+Provides structured Kubernetes pod diagnostics including:
 
-`-- agent.py             # Claude agentic loop wiring the above as tools
-manifests/faults/
+* pod phase
+* scheduling conditions
+* restart counts
+* container state
+* fault-family classification
 
-|-- imagepullbackoff.yaml       # Bad image tag
+### `get_pod_logs.py`
 
-|-- crashloopbackoff.yaml        # Container exits immediately with an error
+Retrieves:
 
-`-- pending-unschedulable.yaml    # Memory request exceeding cluster capacity
-## Safety
+* current container logs
+* previous crash logs
 
-The agent loop is capped at `MAX_ITERATIONS = 6` tool calls. This is a hard
-limit, not a soft suggestion - an unbounded loop against a live cluster
-risks runaway API calls and token spend if a fault type confuses the
-agent's decision logic. In production, the agent's tool-using service
-account should also be scoped to read-only RBAC permissions, since
-diagnosis never requires write access to the cluster.
+Used only when pod state alone is insufficient for root-cause determination.
 
-## Limitations
+### `agent.py`
 
-- Only three fault families are covered. Networking/Service misconfiguration,
-  PersistentVolume issues, and resource-quota rejections are not yet handled
-  and would likely need `get_events` and/or `describe_resource` tools.
-- Tested against a single-node local `kind` cluster. Multi-node scheduling
-  scenarios (e.g. node affinity, taints/tolerations conflicts) are not
-  covered by current fault fixtures.
+Implements the Claude-powered reasoning loop coordinating tool selection and diagnosis.
+
+---
+
+# Safety
+
+The agent loop is protected by:
+
+```python
+MAX_ITERATIONS = 6
+```
+
+This is a hard limit preventing:
+
+* runaway tool invocation,
+* excessive Kubernetes API usage,
+* and uncontrolled token consumption.
+
+In production environments, the troubleshooting agent should also run under read-only RBAC permissions since diagnosis does not require write access to cluster resources.
+
+---
+
+# Limitations
+
+Current coverage is intentionally narrow and focused.
+
+Not yet supported:
+
+* Service/networking failures
+* PersistentVolume issues
+* ResourceQuota enforcement
+* Ingress misconfiguration
+* Multi-node scheduling conflicts
+* Taints/tolerations analysis
+* Node affinity conflicts
+
+The project has only been validated against a single-node local `kind` cluster.
+
+---
+
+# Future improvements
+
+Planned extensions include:
+
+* Kubernetes Events analysis
+* `kubectl describe` parity tooling
+* Service and networking diagnostics
+* PersistentVolume troubleshooting
+* Multi-node scheduling analysis
+* Prometheus integration
+* Slack/Teams incident-response integration
+* Automatic remediation suggestion ranking
+* Historical incident memory and comparison
+
+---
+
+# Key takeaway
+
+This project is not a generic “AI + Kubernetes” demo.
+
+It is an investigation-oriented troubleshooting system built around:
+
+* real Kubernetes behavior,
+* real operational edge cases,
+* deterministic tool validation,
+* and evidence-driven reasoning.
+
+The focus is not simply identifying unhealthy resources.
+
+The focus is identifying *why* they failed.
+

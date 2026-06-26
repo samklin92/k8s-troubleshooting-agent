@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Fast, deterministic, free. Runs on every push and PR - this is the job
+  # that should gate merges. No external API calls, no flakiness risk from
+  # a third-party service being slow or rate-limited.
+  test-tools:
+    name: Test diagnostic tools (kind cluster)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install kubernetes pytest python-dotenv
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: devops-agent-cluster
+
+      - name: Verify cluster is healthy
+        run: |
+          kubectl get nodes
+          kubectl get pods -A
+
+      - name: Run tool test suite
+        run: |
+          pytest tests/test_list_pods.py tests/test_get_pod_logs.py -v
+
+  # Slower, costs real Anthropic API tokens, depends on an external service.
+  # This is an integration smoke test for the full agent loop, not a merge
+  # gate - a transient API hiccup here shouldn't block an unrelated PR.
+  # Requires ANTHROPIC_API_KEY configured as a repository secret.
+  test-agent-smoke:
+    name: Agent integration smoke test (uses Claude API)
+    runs-on: ubuntu-latest
+    needs: test-tools
+    if: github.event_name == 'push'  # skip on PRs from forks, which can't access secrets
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install kubernetes anthropic python-dotenv
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: devops-agent-cluster
+
+      - name: Inject a known fault
+        run: |
+          kubectl apply -f manifests/faults/crashloopbackoff.yaml
+          sleep 20
+
+      - name: Run the agent against the live fault
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          cd k8s_agent
+          python agent.py "A pod seems unhealthy" default | tee /tmp/agent_output.txt
+
+      - name: Verify the agent reached a real diagnosis
+        run: |
+          if grep -qi "INCONCLUSIVE" /tmp/agent_output.txt; then
+            echo "Agent failed to reach a diagnosis within the iteration cap"
+            exit 1
+          fi
+          if ! grep -qi "config" /tmp/agent_output.txt; then
+            echo "Agent's diagnosis did not mention the actual root cause (missing config file)"
+            exit 1
+          fi
+          echo "Agent reached a correct diagnosis"
+
+      - name: Clean up fault
+        if: always()
+        run: kubectl delete -f manifests/faults/crashloopbackoff.yaml --ignore-not-found

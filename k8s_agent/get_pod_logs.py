@@ -24,12 +24,26 @@ Confirmed by comparing against _preload_content=False, which returns clean
 raw bytes with a real newline. The client's own deserialization step
 appears to repr() the bytes instead of decoding them. Workaround: always
 request _preload_content=False and decode the raw bytes ourselves.
+
+Verified behavior (containerd, not our code): even when a container has
+restarted and the API call for --previous logs succeeds without error,
+the actual log content can be a containerd-level error message
+("unable to retrieve container logs for containerd://...") rather than
+real log content, if the previous container's logs have already been
+garbage-collected by the runtime. This is time-sensitive and was caught
+by automated testing under different timing than manual verification -
+the manual test happened to run within the retention window, an
+automated CI run did not. We detect this specific message and report it
+as previous_available=False, since "can't retrieve" is not usable log
+content even though the API call itself didn't raise an error.
 """
 
 from dataclasses import dataclass
 
 from kubernetes import client
 from kubernetes.client.exceptions import ApiException
+
+_CONTAINERD_UNAVAILABLE_PREFIX = "unable to retrieve container logs for"
 
 
 @dataclass
@@ -38,7 +52,7 @@ class PodLogs:
     container_name: str
     current: str | None         # logs from the currently running/most recent container instance
     previous: str | None        # logs from the prior instance, if the container has restarted
-    previous_available: bool    # False if there was no prior instance to fetch (e.g. zero restarts)
+    previous_available: bool    # False if there was no prior instance, or its logs were already GC'd
 
 
 def get_pod_logs(
@@ -55,6 +69,11 @@ def get_pod_logs(
     previous_available = True
     try:
         previous = _fetch_logs(v1, pod_name, container_name, namespace, tail_lines, previous=True)
+        if previous.strip().startswith(_CONTAINERD_UNAVAILABLE_PREFIX):
+            # The API call succeeded, but the runtime has already garbage
+            # collected the previous container's logs. This is not usable
+            # log content - treat it the same as "not available".
+            previous_available = False
     except ApiException as e:
         # 400 from the API typically means there is no previous container
         # instance to fetch logs from (e.g. the container has never restarted).
@@ -67,7 +86,7 @@ def get_pod_logs(
         pod_name=pod_name,
         container_name=container_name,
         current=current,
-        previous=previous,
+        previous=previous if previous_available else None,
         previous_available=previous_available,
     )
 
